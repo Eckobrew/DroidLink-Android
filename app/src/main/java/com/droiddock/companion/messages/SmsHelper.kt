@@ -244,8 +244,35 @@ class SmsHelper(private val context: Context) {
             Log.w(TAG, "Error querying recent MMS: ${e.message}")
         }
 
-        messages.sortByDescending { it.timestamp }
-        return messages.take(limit)
+        val deduped = deduplicate(messages)
+        return deduped.sortedByDescending { it.timestamp }.take(limit)
+    }
+
+    private fun deduplicate(list: List<ChatMessage>): List<ChatMessage> {
+        val result = mutableListOf<ChatMessage>()
+        val seenIds = HashSet<String>()
+        val sorted = list.sortedBy { it.timestamp }
+        for (msg in sorted) {
+            val text = msg.text.trim()
+            if (text.isEmpty()) continue
+            if (seenIds.contains(msg.id)) continue
+
+            var isDup = false
+            val window = result.takeLast(20)
+            for (ex in window) {
+                if (ex.isFromMe == msg.isFromMe &&
+                    ex.text.trim() == text &&
+                    Math.abs(ex.timestamp - msg.timestamp) < 60_000L) {
+                    isDup = true
+                    break
+                }
+            }
+            if (!isDup) {
+                seenIds.add(msg.id)
+                result.add(msg)
+            }
+        }
+        return result
     }
 
     fun getAllMessages(): List<ChatMessage> {
@@ -434,8 +461,8 @@ class SmsHelper(private val context: Context) {
             Log.e(TAG, "Error querying SMS messages", e)
         }
 
-        // 5. Sort all combined messages newest first so Mac receives recent messages immediately
-        allMessages.sortByDescending { it.timestamp }
-        return allMessages
+        // 5. Deduplicate and sort all combined messages newest first so Mac receives recent messages immediately
+        val deduped = deduplicate(allMessages)
+        return deduped.sortedByDescending { it.timestamp }
     }
 }

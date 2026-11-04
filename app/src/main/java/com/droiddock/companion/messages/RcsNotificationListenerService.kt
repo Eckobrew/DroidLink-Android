@@ -201,6 +201,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
                         if (!act.remoteInputs.isNullOrEmpty()) canReply = true
                     }
 
+                    val artworkBase64 = extractArtworkBase64(context, sbn)
                     notifs.add(
                         AppNotification(
                             id = sbn.key,
@@ -210,7 +211,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
                             text = text,
                             subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString(),
                             timestamp = sbn.postTime,
-                            iconBase64 = null,
+                            iconBase64 = artworkBase64,
                             canReply = canReply,
                             isClearable = sbn.isClearable
                         )
@@ -225,6 +226,35 @@ class RcsNotificationListenerService : NotificationListenerService() {
                 Log.d(TAG, "Synced ${notifs.size} active notifications with Mac")
             } catch (e: Exception) {
                 Log.w(TAG, "Error syncing active notifications: ${e.message}")
+            }
+        }
+
+        fun extractArtworkBase64(context: Context, sbn: StatusBarNotification): String? {
+            return try {
+                val largeIcon = sbn.notification.getLargeIcon()
+                val drawable = largeIcon?.loadDrawable(context) ?: context.packageManager.getApplicationIcon(sbn.packageName)
+                val bitmap = when (drawable) {
+                    is android.graphics.drawable.BitmapDrawable -> drawable.bitmap
+                    else -> {
+                        val w = if (drawable.intrinsicWidth > 0) Math.min(drawable.intrinsicWidth, 128) else 64
+                        val h = if (drawable.intrinsicHeight > 0) Math.min(drawable.intrinsicHeight, 128) else 64
+                        val bmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                        val canvas = android.graphics.Canvas(bmp)
+                        drawable.setBounds(0, 0, canvas.width, canvas.height)
+                        drawable.draw(canvas)
+                        bmp
+                    }
+                }
+                val stream = java.io.ByteArrayOutputStream()
+                val scaled = if (bitmap.width > 128 || bitmap.height > 128) {
+                    android.graphics.Bitmap.createScaledBitmap(bitmap, 96, 96, true)
+                } else {
+                    bitmap
+                }
+                scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, stream)
+                android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.NO_WRAP)
+            } catch (e: Exception) {
+                null
             }
         }
     }
@@ -307,8 +337,23 @@ class RcsNotificationListenerService : NotificationListenerService() {
             }
         }
 
-        // 1. If messaging app, handle RCS/SMS chat pipeline
-        if (isMessagingApp && cleanText.isNotEmpty()) {
+        // Filter out Google Messages internal background tasks, pairing status, and system noise
+        val isSystemNoise = title.equals("Device pairing", ignoreCase = true) ||
+                (title.equals("Messages", ignoreCase = true) && !canReply) ||
+                title.equals("Unknown", ignoreCase = true) ||
+                cleanText.contains("Messages is doing work", ignoreCase = true) ||
+                cleanText.contains("Your messages are available", ignoreCase = true) ||
+                cleanText.contains("pairing with", ignoreCase = true) ||
+                cleanText.contains("Chat features", ignoreCase = true) ||
+                cleanText.contains("RCS chats", ignoreCase = true)
+
+        if (isSystemNoise) {
+            Log.d(TAG, "Ignoring Google Messages background service notification: '$title' / '$cleanText'")
+            return
+        }
+
+        // 1. If messaging app, handle RCS/SMS chat pipeline ONLY for real user messages with reply capability
+        if (isMessagingApp && cleanText.isNotEmpty() && !sbn.isOngoing && canReply) {
             val sender = if (title.isNotBlank()) title else "Unknown"
             val contactsHelper = ContactsHelper(applicationContext)
             val resolvedName = contactsHelper.resolveContactName(sender)
@@ -357,6 +402,8 @@ class RcsNotificationListenerService : NotificationListenerService() {
             pkg
         }
 
+        val artworkBase64 = extractArtworkBase64(applicationContext, sbn)
+
         val appNotification = AppNotification(
             id = sbn.key,
             packageName = pkg,
@@ -365,7 +412,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
             text = cleanText,
             subText = subText,
             timestamp = sbn.postTime,
-            iconBase64 = null,
+            iconBase64 = artworkBase64,
             canReply = canReply,
             isClearable = sbn.isClearable
         )
