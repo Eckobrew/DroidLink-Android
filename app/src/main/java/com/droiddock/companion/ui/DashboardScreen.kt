@@ -29,7 +29,6 @@ fun DashboardScreen(
     val context = LocalContext.current
     val connMgr = remember { ConnectionManager.getInstance(context) }
     val connectionState by connMgr.transport.collectAsState()
-    val bluetoothStatus by connMgr.bluetoothStatus.collectAsState()
     var fallbackEnabled by remember { mutableStateOf(connMgr.bluetoothFallbackEnabled) }
 
     Column(
@@ -65,13 +64,13 @@ fun DashboardScreen(
                 }
 
                 Text(
-                    text = if (connectionState != "disconnected") "Active Transport: ${connectionState.uppercase()}" else "Status: Waiting for Wi-Fi or Bluetooth",
+                    text = if (connectionState != "disconnected") if (connectionState == "wifi") "Connected over Wi-Fi" else "Connected over Bluetooth" else "Looking for your Mac",
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 Text(
-                    text = if (connectionState != "disconnected") "End-to-End Encryption: ECDH P-256 + AES-256-GCM Active" else "Keep the Mac app open; enable Nearby Devices for Bluetooth fallback",
+                    text = if (connectionState != "disconnected") "Your connection is end-to-end encrypted" else "Keep Droid Link open on your Mac",
                     fontSize = 12.sp,
                     color = if (connectionState != "disconnected") Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                     fontWeight = FontWeight.Medium
@@ -81,8 +80,8 @@ fun DashboardScreen(
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Bluetooth data fallback", fontWeight = FontWeight.Medium)
-                Text(bluetoothStatus, fontSize = 12.sp)
+                Text("Bluetooth fallback", fontWeight = FontWeight.Medium)
+                Text("Stay connected when Wi-Fi is unavailable", fontSize = 12.sp)
             }
             TextButton(onClick = { connMgr.retryBluetoothConnection() }, enabled = fallbackEnabled) { Text("Retry") }
             Switch(checked = fallbackEnabled, onCheckedChange = {
@@ -92,7 +91,7 @@ fun DashboardScreen(
         }
 
         Text(
-            text = "Companion Hub Services",
+            text = "Settings",
             fontSize = 16.sp,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.padding(top = 8.dp)
@@ -101,11 +100,23 @@ fun DashboardScreen(
         // RCS Service Card
         ServiceStatusRow(
             icon = Icons.Default.Chat,
-            title = "RCS & SMS Companion Bridge",
-            subtitle = "Captures carrier RCS chats and enables Mac replies",
+            title = "Messages & notifications",
+            subtitle = "Allow messages, images and notifications to appear on your Mac",
             actionLabel = "Notification Access",
             onAction = {
                 context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            }
+        )
+
+        ServiceStatusRow(
+            icon = Icons.Default.Notifications,
+            title = "Connection notification",
+            subtitle = "Show your connection status while the app runs in the background",
+            actionLabel = "Manage",
+            onAction = {
+                context.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    .putExtra(Settings.EXTRA_CHANNEL_ID, com.droiddock.companion.DroidDockApplication.CHANNEL_ID))
             }
         )
 
@@ -118,8 +129,8 @@ fun DashboardScreen(
         // Handset Audio Routing Card
         ServiceStatusRow(
             icon = Icons.Default.Headphones,
-            title = "Bluetooth Audio Gateway",
-            subtitle = "Mac acts as Hands-Free handset for in-call voice",
+            title = "Call audio",
+            subtitle = "Pair your Mac to use its speakers and microphone for calls",
             actionLabel = "Bluetooth",
             onAction = {
                 context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
@@ -127,17 +138,6 @@ fun DashboardScreen(
         )
 
         Spacer(modifier = Modifier.height(12.dp))
-
-        OutlinedButton(
-            onClick = {
-                connMgr.sendDeviceStatus()
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Send Sync Ping to Mac")
-        }
 
         Button(
             onClick = onUnpair,

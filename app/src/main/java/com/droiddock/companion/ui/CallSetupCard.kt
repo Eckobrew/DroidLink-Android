@@ -37,13 +37,13 @@ fun CallSetupCard() {
         result = when {
             it.resultCode != Activity.RESULT_OK -> "Call setup was cancelled."
             ready -> "Call controls enabled. Also pair this Mac in Bluetooth settings and enable Phone calls for audio."
-            else -> "Association saved. Reopen the app after pairing; this phone has not granted call-control access yet."
+            else -> "Mac linked. Reopen the app to finish enabling call controls."
         }
     }
     ServiceStatusRow(
         icon = Icons.Default.Phone,
         title = "Mac call controls",
-        subtitle = "Select your Mac in Android's companion-device setup. Your current phone app stays in use.",
+        subtitle = "Enable answering and managing calls from your Mac.",
         actionLabel = "Enable call controls",
         onAction = {
             if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_COMPANION_DEVICE_SETUP)) {
@@ -61,10 +61,10 @@ fun CallSetupCard() {
                                 launcher.launch(IntentSenderRequest.Builder(chooserLauncher).build())
                             }
                             override fun onFailure(error: CharSequence?) {
-                                result = error?.toString() ?: "Could not find the Mac. Open Bluetooth settings on the Mac to make it discoverable."
+                                result = "Could not find the Mac. Open Bluetooth settings on the Mac and try again."
                             }
                         }, Handler(Looper.getMainLooper()))
-                } catch (e: Exception) { result = e.message ?: "Call setup could not start." }
+                } catch (e: Exception) { result = "Call setup could not start. Please try again." }
             }
         }
     )
