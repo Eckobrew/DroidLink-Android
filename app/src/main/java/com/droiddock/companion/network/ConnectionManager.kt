@@ -287,6 +287,7 @@ class ConnectionManager private constructor(private val context: Context) {
             synchronized(this) { if (bleSession === session) { bleSession = null; true } else false }
         }
         try { session.socket?.close() } catch (_: Exception) {}
+        if (wasCurrent && session.source == "wifi") com.droiddock.companion.mirroring.MirrorCoordinator.stop(context, message = "Screen sharing stopped because Wi-Fi disconnected")
         if (wasCurrent && session.source == "bluetooth") ble.disconnect()
         if (wasCurrent && !session.ready) session.pairingResult?.let { callback ->
             scope.launch(Dispatchers.Main) { callback(false, "Mac verification failed or timed out. Update both applications and try again.") }
@@ -326,7 +327,7 @@ class ConnectionManager private constructor(private val context: Context) {
         }
         sendDirect(MessageEnvelope(type = EnvelopeTypes.ENVELOPE_ACK, payload = envelope.id), session)
         if (!seen.insert(envelope.id)) return
-        handleInboundEnvelope(envelope)
+        handleInboundEnvelope(envelope, session)
     }
 
     fun syncAllContacts() {
@@ -429,8 +430,18 @@ class ConnectionManager private constructor(private val context: Context) {
     }
 
 
-    private fun handleInboundEnvelope(envelope: MessageEnvelope) {
+    private fun handleInboundEnvelope(envelope: MessageEnvelope, session: Session) {
         when (envelope.type) {
+            EnvelopeTypes.MIRROR_START -> {
+                if (session.source != "wifi" || session.socket == null) return
+                val offer = gson.fromJson(envelope.payload, com.droiddock.companion.mirroring.MirrorOffer::class.java)
+                val host = session.socket.inetAddress.hostAddress ?: return
+                com.droiddock.companion.mirroring.MirrorCoordinator.receive(context, offer, host)
+            }
+            EnvelopeTypes.MIRROR_STOP -> {
+                val id = org.json.JSONObject(envelope.payload).optString("sessionId")
+                com.droiddock.companion.mirroring.MirrorCoordinator.stop(context, id)
+            }
             EnvelopeTypes.TRANSPORT_PROBE -> {
                 sendEnvelope(MessageEnvelope(type = EnvelopeTypes.TRANSPORT_PROBE, payload = envelope.payload))
             }
@@ -517,8 +528,8 @@ class ConnectionManager private constructor(private val context: Context) {
             }
 
             EnvelopeTypes.MEDIA_CONTROL -> {
-                val command = org.json.JSONObject(envelope.payload).optString("action")
-                RcsNotificationListenerService.controlMedia(context, command)
+                val request = org.json.JSONObject(envelope.payload)
+                RcsNotificationListenerService.controlMedia(context, request.optString("action"), request.optString("notificationId"))
             }
 
             EnvelopeTypes.APP_SYNC -> {

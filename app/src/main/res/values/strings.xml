@@ -1,0 +1,3 @@
+<resources>
+    <string name="mirror_accessibility_description">Allow your paired Mac to tap, swipe and edit focused text fields only during a screen sharing session you approve. Stop sharing to disable remote input.</string>
+</resources>

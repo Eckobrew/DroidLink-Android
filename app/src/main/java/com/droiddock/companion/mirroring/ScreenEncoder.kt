@@ -44,7 +44,15 @@ class ScreenEncoder(width: Int, height: Int, bitrate: Int = 4_000_000, fps: Int 
         val info = MediaCodec.BufferInfo()
         while (true) {
             val index = codec.dequeueOutputBuffer(info, 0)
-            if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
+            if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                val format = codec.outputFormat
+                val config = listOfNotNull(format.getByteBuffer("csd-0"), format.getByteBuffer("csd-1"))
+                    .fold(ByteArray(0)) { bytes, buffer ->
+                        val copy = buffer.duplicate(); val next = ByteArray(copy.remaining()); copy.get(next); bytes + next
+                    }
+                if (config.isNotEmpty()) consume(VideoPacket(VideoPacket.CONFIG, 0, config))
+                continue
+            }
             if (index < 0) return
             try {
                 if (info.size > 0) {
@@ -65,6 +73,10 @@ class ScreenEncoder(width: Int, height: Int, bitrate: Int = 4_000_000, fps: Int 
                 codec.releaseOutputBuffer(index, false)
             }
         }
+    }
+
+    fun requestKeyFrame() {
+        if (!closed) codec.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
     }
 
     override fun close() {
