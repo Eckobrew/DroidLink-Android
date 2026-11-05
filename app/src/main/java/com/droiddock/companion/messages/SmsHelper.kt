@@ -7,6 +7,7 @@ import android.provider.Telephony
 import android.telephony.SmsManager
 import android.util.Log
 import com.droiddock.companion.network.ChatMessage
+import com.droiddock.companion.network.MessageAttachment
 
 class SmsHelper(private val context: Context) {
 
@@ -29,13 +30,16 @@ class SmsHelper(private val context: Context) {
         }
     }
 
-    fun sendSms(destinationAddress: String, text: String): Boolean {
+    fun sendSms(destinationAddress: String, text: String, messageId: String): Boolean {
         return try {
+            require(destinationAddress.isNotBlank() && text.isNotBlank())
             val parts = smsManager.divideMessage(text)
+            val sentIntents = ArrayList(parts.indices.map { SmsStatusReceiver.pendingIntent(context, messageId, it, parts.size, false) })
+            val deliveryIntents = ArrayList(parts.indices.map { SmsStatusReceiver.pendingIntent(context, messageId, it, parts.size, true) })
             if (parts.size > 1) {
-                smsManager.sendMultipartTextMessage(destinationAddress, null, parts, null, null)
+                smsManager.sendMultipartTextMessage(destinationAddress, null, parts, sentIntents, deliveryIntents)
             } else {
-                smsManager.sendTextMessage(destinationAddress, null, text, null, null)
+                smsManager.sendTextMessage(destinationAddress, null, text, sentIntents.first(), deliveryIntents.first())
             }
             Log.d(TAG, "Sent SMS to $destinationAddress")
             true
@@ -107,7 +111,7 @@ class SmsHelper(private val context: Context) {
         try {
             val cursor = context.contentResolver.query(
                 Telephony.Sms.CONTENT_URI,
-                arrayOf("_id", "thread_id", "address", "body", "date", "type"),
+                arrayOf("_id", "thread_id", "address", "body", "date", "type", "status"),
                 null,
                 null,
                 "date DESC LIMIT $limit"
@@ -119,6 +123,7 @@ class SmsHelper(private val context: Context) {
                 val bodyIdx = it.getColumnIndex("body")
                 val dateIdx = it.getColumnIndex("date")
                 val typeIdx = it.getColumnIndex("type")
+                val statusIdx = it.getColumnIndex("status")
 
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
@@ -130,7 +135,14 @@ class SmsHelper(private val context: Context) {
                     val body = it.getString(bodyIdx) ?: ""
                     val date = it.getLong(dateIdx)
                     val type = it.getInt(typeIdx)
-                    val isOutgoing = (type == Telephony.Sms.MESSAGE_TYPE_SENT)
+                    if (type == Telephony.Sms.MESSAGE_TYPE_DRAFT) continue
+                    val isOutgoing = (type != Telephony.Sms.MESSAGE_TYPE_INBOX)
+                    val smsStatus = when {
+                        type == Telephony.Sms.MESSAGE_TYPE_FAILED -> "failed"
+                        type == Telephony.Sms.MESSAGE_TYPE_OUTBOX || type == Telephony.Sms.MESSAGE_TYPE_QUEUED -> "sending"
+                        isOutgoing && it.getInt(statusIdx) != Telephony.Sms.STATUS_COMPLETE -> "sent"
+                        else -> "delivered"
+                    }
                     val contactName = contactsHelper.resolveContactName(addr)
 
                     messages.add(
@@ -142,7 +154,7 @@ class SmsHelper(private val context: Context) {
                             isFromMe = isOutgoing,
                             text = body,
                             timestamp = date,
-                            status = "delivered",
+                            status = smsStatus,
                             messageType = "SMS"
                         )
                     )
@@ -158,7 +170,7 @@ class SmsHelper(private val context: Context) {
             val mmsMeta = mutableMapOf<Long, Pair<Boolean, String>>() // mid -> (isOutgoing, isRcs)
             val mmsCursor = context.contentResolver.query(
                 MMS_URI,
-                arrayOf("_id", "thread_id", "date", "msg_box", "creator", "tr_id", "ct_cls"),
+                arrayOf("_id", "thread_id", "date", "msg_box"),
                 null,
                 null,
                 "date DESC LIMIT $limit"
@@ -168,9 +180,6 @@ class SmsHelper(private val context: Context) {
                 val threadIdx = it.getColumnIndex("thread_id")
                 val dateIdx = it.getColumnIndex("date")
                 val boxIdx = it.getColumnIndex("msg_box")
-                val creatorIdx = it.getColumnIndex("creator")
-                val trIdx = it.getColumnIndex("tr_id")
-                val clsIdx = it.getColumnIndex("ct_cls")
 
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
@@ -178,16 +187,9 @@ class SmsHelper(private val context: Context) {
                     val dateSec = it.getLong(dateIdx)
                     val msgBox = it.getInt(boxIdx)
                     val isOutgoing = (msgBox == 2)
-                    val creator = if (creatorIdx != -1) it.getString(creatorIdx) else null
-                    val trId = if (trIdx != -1) it.getString(trIdx) else null
-                    val ctCls = if (clsIdx != -1) it.getInt(clsIdx) else -1
-                    val isRcs = (creator?.contains("messaging") == true) ||
-                            (trId?.startsWith("proto:") == true) ||
-                            (ctCls == 135) ||
-                            (creator != null && creator != "com.android.mms")
 
                     mmsHeaders.add(Triple(id, threadId, dateSec))
-                    mmsMeta[id] = Pair(isOutgoing, if (isRcs) "RCS" else "MMS")
+                    mmsMeta[id] = Pair(isOutgoing, "Unconfirmed")
                 }
             }
 
@@ -196,17 +198,25 @@ class SmsHelper(private val context: Context) {
                 val idsList = mmsHeaders.map { it.first }
                 val partCursor = context.contentResolver.query(
                     MMS_PART_URI,
-                    arrayOf("mid", "text"),
-                    "ct = 'text/plain' AND mid IN (${idsList.joinToString(",")})",
+                    arrayOf("_id", "mid", "text", "ct"),
+                    "(ct = 'text/plain' OR ct LIKE 'image/%') AND mid IN (${idsList.joinToString(",")})",
                     null,
                     null
                 )
                 val partTexts = mutableMapOf<Long, String>()
+                val partImages = mutableMapOf<Long, MutableList<MessageAttachment>>()
                 partCursor?.use {
                     val midIdx = it.getColumnIndex("mid")
                     val textIdx = it.getColumnIndex("text")
+                    val idIdx = it.getColumnIndex("_id")
+                    val mimeIdx = it.getColumnIndex("ct")
                     while (it.moveToNext()) {
                         val mid = it.getLong(midIdx)
+                        val mime = it.getString(mimeIdx) ?: ""
+                        if (mime.startsWith("image/")) {
+                            partImages.getOrPut(mid) { mutableListOf() }.add(MessageAttachment("content://mms/part/${it.getLong(idIdx)}", mime))
+                            continue
+                        }
                         val text = it.getString(textIdx) ?: ""
                         if (text.isNotBlank()) {
                             partTexts[mid] = text
@@ -218,8 +228,10 @@ class SmsHelper(private val context: Context) {
                     val mid = header.first
                     val threadId = header.second
                     val dateSec = header.third
-                    val body = partTexts[mid] ?: continue
-                    val meta = mmsMeta[mid] ?: Pair(false, "MMS")
+                    val body = partTexts[mid] ?: ""
+                    val images = partImages[mid] ?: emptyList()
+                    if (body.isBlank() && images.isEmpty()) continue
+                    val meta = mmsMeta[mid] ?: Pair(false, "Unconfirmed")
                     val isOutgoing = meta.first
                     val msgType = meta.second
                     val address = threadToPhoneMap[threadId] ?: "Unknown"
@@ -234,7 +246,8 @@ class SmsHelper(private val context: Context) {
                             isFromMe = isOutgoing,
                             text = body,
                             timestamp = dateSec * 1000L,
-                            status = "delivered",
+                            status = if (isOutgoing) "sent" else "delivered",
+                            attachments = images,
                             messageType = msgType
                         )
                     )
@@ -249,38 +262,17 @@ class SmsHelper(private val context: Context) {
     }
 
     private fun deduplicate(list: List<ChatMessage>): List<ChatMessage> {
-        val result = mutableListOf<ChatMessage>()
-        val seenIds = HashSet<String>()
-        val sorted = list.sortedBy { it.timestamp }
-        for (msg in sorted) {
-            val text = msg.text.trim()
-            if (text.isEmpty()) continue
-            if (seenIds.contains(msg.id)) continue
-
-            var isDup = false
-            val window = result.takeLast(20)
-            for (ex in window) {
-                if (ex.isFromMe == msg.isFromMe &&
-                    ex.text.trim() == text &&
-                    Math.abs(ex.timestamp - msg.timestamp) < 60_000L) {
-                    isDup = true
-                    break
-                }
-            }
-            if (!isDup) {
-                seenIds.add(msg.id)
-                result.add(msg)
-            }
-        }
-        return result
+        // Provider IDs identify messages. Repeated text is valid, even seconds apart.
+        return list.distinctBy { it.id }.filter { it.text.isNotBlank() || it.attachments.isNotEmpty() }
     }
 
     fun getAllMessages(): List<ChatMessage> {
         val allMessages = mutableListOf<ChatMessage>()
-        val contactMap = contactsHelper.getContactMap()
+        contactsHelper.getContactMap()
         val threadToPhoneMap = getThreadToPhoneMap()
 
         // 2. Query ALL MMS & RCS text parts in batches (to overcome 2MB CursorWindow limit)
+        val mmsImages = mutableMapOf<Long, MutableList<MessageAttachment>>()
         val mmsPartTexts = mutableMapOf<Long, String>() // mid -> text
         try {
             var lastPartId = 0L
@@ -289,8 +281,8 @@ class SmsHelper(private val context: Context) {
                 loopCount++
                 val partCursor = context.contentResolver.query(
                     MMS_PART_URI,
-                    arrayOf("_id", "mid", "text"),
-                    "ct = 'text/plain' AND _id > $lastPartId",
+                    arrayOf("_id", "mid", "text", "ct"),
+                    "(ct = 'text/plain' OR ct LIKE 'image/%') AND _id > $lastPartId",
                     null,
                     "_id ASC"
                 )
@@ -305,10 +297,15 @@ class SmsHelper(private val context: Context) {
                     val idIdx = it.getColumnIndex("_id")
                     val midIdx = it.getColumnIndex("mid")
                     val textIdx = it.getColumnIndex("text")
+                    val mimeIdx = it.getColumnIndex("ct")
 
                     while (it.moveToNext()) {
                         val id = it.getLong(idIdx)
                         val mid = it.getLong(midIdx)
+                        val mime = it.getString(mimeIdx) ?: ""
+                        if (mime.startsWith("image/")) {
+                            mmsImages.getOrPut(mid) { mutableListOf() }.add(MessageAttachment("content://mms/part/$id", mime))
+                        }
                         val text = it.getString(textIdx) ?: ""
                         if (text.isNotBlank()) {
                             mmsPartTexts[mid] = text
@@ -335,7 +332,7 @@ class SmsHelper(private val context: Context) {
                 mmsLoopCount++
                 val mmsCursor = context.contentResolver.query(
                     MMS_URI,
-                    arrayOf("_id", "thread_id", "date", "msg_box", "creator", "tr_id", "ct_cls"),
+                    arrayOf("_id", "thread_id", "date", "msg_box"),
                     "_id > $lastMmsId",
                     null,
                     "_id ASC"
@@ -352,9 +349,6 @@ class SmsHelper(private val context: Context) {
                     val threadIdx = it.getColumnIndex("thread_id")
                     val dateIdx = it.getColumnIndex("date")
                     val boxIdx = it.getColumnIndex("msg_box")
-                    val creatorIdx = it.getColumnIndex("creator")
-                    val trIdx = it.getColumnIndex("tr_id")
-                    val clsIdx = it.getColumnIndex("ct_cls")
 
                     while (it.moveToNext()) {
                         val id = it.getLong(idIdx)
@@ -363,23 +357,19 @@ class SmsHelper(private val context: Context) {
                         }
                         batchCount++
 
-                        val body = mmsPartTexts[id] ?: continue
+                        val body = mmsPartTexts[id] ?: ""
+                        val images = mmsImages[id] ?: emptyList()
+                        if (body.isBlank() && images.isEmpty()) continue
                         val threadId = it.getLong(threadIdx)
                         val dateSec = it.getLong(dateIdx)
                         val msgBox = it.getInt(boxIdx) // 1 = inbox, 2 = sent
                         val isOutgoing = (msgBox == 2)
-                        val creator = if (creatorIdx != -1) it.getString(creatorIdx) else null
-                        val trId = if (trIdx != -1) it.getString(trIdx) else null
-                        val ctCls = if (clsIdx != -1) it.getInt(clsIdx) else -1
 
                         val address = threadToPhoneMap[threadId] ?: "Unknown"
                         val contactName = contactsHelper.resolveContactName(address)
 
-                        // Google Messages / RCS tagging
-                        val isRcs = (creator?.contains("messaging") == true) ||
-                                (trId?.startsWith("proto:") == true) ||
-                                (ctCls == 135) ||
-                                (creator != null && creator != "com.android.mms")
+                        // This store can contain imported messaging-app records. Its URI alone
+                        // does not prove whether the message used MMS or RCS.
 
                         allMessages.add(
                             ChatMessage(
@@ -390,8 +380,9 @@ class SmsHelper(private val context: Context) {
                                 isFromMe = isOutgoing,
                                 text = body,
                                 timestamp = dateSec * 1000L,
-                                status = "delivered",
-                                messageType = if (isRcs) "RCS" else "MMS"
+                                status = if (isOutgoing) "sent" else "delivered",
+                                attachments = images,
+                                messageType = "Unconfirmed"
                             )
                         )
                     }
@@ -410,7 +401,7 @@ class SmsHelper(private val context: Context) {
             while (true) {
                 val cursor = context.contentResolver.query(
                     Telephony.Sms.CONTENT_URI,
-                    arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE),
+                    arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE, Telephony.Sms.STATUS),
                     "${Telephony.Sms._ID} > $lastSmsId",
                     null,
                     "${Telephony.Sms._ID} ASC"
@@ -423,6 +414,7 @@ class SmsHelper(private val context: Context) {
                     val bodyIdx = it.getColumnIndex(Telephony.Sms.BODY)
                     val dateIdx = it.getColumnIndex(Telephony.Sms.DATE)
                     val typeIdx = it.getColumnIndex(Telephony.Sms.TYPE)
+                    val statusIdx = it.getColumnIndex(Telephony.Sms.STATUS)
 
                     while (it.moveToNext()) {
                         val id = it.getLong(idIdx)
@@ -435,7 +427,14 @@ class SmsHelper(private val context: Context) {
                         val body = it.getString(bodyIdx) ?: ""
                         val date = it.getLong(dateIdx)
                         val type = it.getInt(typeIdx)
-                        val isOutgoing = (type == Telephony.Sms.MESSAGE_TYPE_SENT)
+                        if (type == Telephony.Sms.MESSAGE_TYPE_DRAFT) continue
+                        val isOutgoing = (type != Telephony.Sms.MESSAGE_TYPE_INBOX)
+                        val smsStatus = when {
+                            type == Telephony.Sms.MESSAGE_TYPE_FAILED -> "failed"
+                            type == Telephony.Sms.MESSAGE_TYPE_OUTBOX || type == Telephony.Sms.MESSAGE_TYPE_QUEUED -> "sending"
+                            isOutgoing && it.getInt(statusIdx) != Telephony.Sms.STATUS_COMPLETE -> "sent"
+                            else -> "delivered"
+                        }
 
                         val contactName = contactsHelper.resolveContactName(addr)
 
@@ -448,7 +447,7 @@ class SmsHelper(private val context: Context) {
                                 isFromMe = isOutgoing,
                                 text = body,
                                 timestamp = date,
-                                status = "delivered",
+                                status = smsStatus,
                                 messageType = "SMS"
                             )
                         )

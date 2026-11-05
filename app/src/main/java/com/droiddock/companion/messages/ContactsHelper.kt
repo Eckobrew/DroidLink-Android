@@ -14,17 +14,21 @@ class ContactsHelper(private val context: Context) {
 
     // Cache of normalized/clean numbers to display names
     private val contactCache = mutableMapOf<String, String>()
+    private val lookupCache = mutableMapOf<String, String>()
     private var lastCacheTime: Long = 0
     private val CACHE_TTL_MS = 60_000 // 1 minute cache
 
     @Synchronized
-    fun getContactMap(): Map<String, String> {
+    fun getContactMap(): Map<String, String> = refreshContactMap().toMap()
+
+    private fun refreshContactMap(): Map<String, String> {
         val now = System.currentTimeMillis()
-        if (contactCache.isNotEmpty() && (now - lastCacheTime < CACHE_TTL_MS)) {
+        if (lastCacheTime != 0L && (now - lastCacheTime < CACHE_TTL_MS)) {
             return contactCache
         }
 
         contactCache.clear()
+        lookupCache.clear()
         try {
             val cursor = context.contentResolver.query(
                 ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
@@ -65,10 +69,13 @@ class ContactsHelper(private val context: Context) {
         return contactCache
     }
 
+    @Synchronized
     fun resolveContactName(phoneNumber: String?): String {
         if (phoneNumber.isNullOrBlank()) return "Unknown"
         val clean = cleanNumber(phoneNumber)
-        val map = getContactMap()
+        val map = refreshContactMap()
+
+        lookupCache[phoneNumber]?.let { return it }
 
         // 1. Exact match in cache
         map[clean]?.let { return it }
@@ -100,7 +107,7 @@ class ContactsHelper(private val context: Context) {
                 if (it.moveToNext()) {
                     val name = it.getString(0)
                     if (!name.isNullOrBlank()) {
-                        contactCache[clean] = name
+                        lookupCache[phoneNumber] = name
                         return name
                     }
                 }
@@ -109,6 +116,7 @@ class ContactsHelper(private val context: Context) {
             // Ignore phone lookup errors
         }
 
+        lookupCache[phoneNumber] = phoneNumber
         return phoneNumber
     }
 

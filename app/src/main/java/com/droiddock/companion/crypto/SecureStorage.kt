@@ -67,6 +67,12 @@ class SecureStorage(context: Context) {
 
     fun getMacDeviceName(): String? = prefs.getString("mac_device_name", null)
 
+    fun clearPairing() {
+        val editor = prefs.edit()
+        for (key in listOf("peer_public_key", "mac_endpoint_ip", "mac_endpoint_port", "mac_candidate_endpoints", "mac_device_name")) editor.remove(key)
+        editor.apply()
+    }
+
     fun clearAll() {
         prefs.edit().clear().apply()
     }

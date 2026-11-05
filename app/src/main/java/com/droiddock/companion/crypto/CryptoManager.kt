@@ -83,13 +83,14 @@ class CryptoManager(private val context: Context) {
             val v1 = digest[1].toInt() and 0xFF
             val v2 = digest[2].toInt() and 0xFF
             val code = ((v0 shl 16) or (v1 shl 8) or v2) % 1_000_000
-            return String.format("%06d", code)
+            return String.format(java.util.Locale.ROOT, "%06d", code)
         }
 
     /**
      * Performs ECDH Key Agreement with the remote Mac's ANSI X9.63 public key and derives AES-256-GCM key.
      */
-    fun establishSharedKey(remotePublicKeyBase64: String, salt: String = "DroidDock_E2EE_v1") {
+    @Synchronized
+    fun establishSharedKey(remotePublicKeyBase64: String, salt: String = "DroidDock_E2EE_v1", persistPeer: Boolean = true) {
         val raw = Base64.decode(remotePublicKeyBase64, Base64.NO_WRAP)
         require(raw.size == 65 && raw[0] == 0x04.toByte()) { "Invalid ANSI X9.63 public key" }
 
@@ -118,7 +119,7 @@ class CryptoManager(private val context: Context) {
         )
 
         this.sharedKey = SecretKeySpec(symmetricKeyBytes, "AES")
-        secureStorage.savePeerPublicKey(remotePublicKeyBase64)
+        if (persistPeer) secureStorage.savePeerPublicKey(remotePublicKeyBase64)
         outboundSequence = 0
         lastInboundSequence = 0
     }
@@ -139,6 +140,7 @@ class CryptoManager(private val context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         val spec = GCMParameterSpec(128, iv)
         cipher.init(Cipher.ENCRYPT_MODE, key, spec)
+        cipher.updateAAD(ByteBuffer.allocate(8).putLong(seq).array())
         val ciphertextAndTag = cipher.doFinal(plaintext)
 
         val buffer = ByteBuffer.allocate(8 + 12 + ciphertextAndTag.size)
@@ -167,9 +169,10 @@ class CryptoManager(private val context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         val spec = GCMParameterSpec(128, iv)
         cipher.init(Cipher.DECRYPT_MODE, key, spec)
+        cipher.updateAAD(packet.copyOfRange(0, 8))
         val decrypted = cipher.doFinal(ciphertextAndTag)
 
-        if (seq <= lastInboundSequence && seq != 1L && lastInboundSequence != 0L) {
+        if (seq <= lastInboundSequence) {
             throw SecurityException("Replay attack detected: duplicate or stale packet")
         }
         lastInboundSequence = seq

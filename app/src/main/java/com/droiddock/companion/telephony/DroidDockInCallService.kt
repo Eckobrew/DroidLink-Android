@@ -1,171 +1,185 @@
 package com.droiddock.companion.telephony
 
-import android.os.Build
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.telecom.Call
 import android.telecom.CallAudioState
+import android.telecom.DisconnectCause
 import android.telecom.InCallService
 import android.telecom.VideoProfile
 import android.util.Log
-import com.droiddock.companion.network.CallActionPayload
-import com.droiddock.companion.network.ConnectionManager
-import com.droiddock.companion.network.EnvelopeTypes
-import com.droiddock.companion.network.MessageEnvelope
-import com.droiddock.companion.network.PhoneCall
+import com.droiddock.companion.network.*
 import com.google.gson.Gson
-import java.util.concurrent.ConcurrentHashMap
+import java.util.UUID
 
 class DroidDockInCallService : InCallService() {
+    private val handler = Handler(Looper.getMainLooper())
+    private val activeCalls = linkedMapOf<String, Call>()
+    private val callbacks = mutableMapOf<Call, Call.Callback>()
+    private val ids = mutableMapOf<Call, String>()
+    private val reportedEnded = mutableSetOf<String>()
+    private var muted = false
+    @Volatile private var audioRoute = CallAudioState.ROUTE_EARPIECE
+    private val dtmfStops = mutableMapOf<Call, Runnable>()
 
     companion object {
         private const val TAG = "DroidDockInCall"
-        var activeInstance: DroidDockInCallService? = null
+        @Volatile var activeInstance: DroidDockInCallService? = null
             private set
 
-        private val activeCalls = ConcurrentHashMap<String, Call>()
-
-        fun executeCallAction(payload: CallActionPayload) {
-            val service = activeInstance ?: run {
-                Log.w(TAG, "No active InCallService instance")
-                return
-            }
-
-            val targetCall = payload.callId?.let { activeCalls[it] } ?: activeCalls.values.firstOrNull()
-
-            when (payload.action) {
-                "answer" -> {
-                    targetCall?.let {
-                        it.answer(VideoProfile.STATE_AUDIO_ONLY)
-                        service.routeAudioToBluetooth()
-                        Log.d(TAG, "Answered call via Mac instruction")
-                    }
-                }
-                "reject" -> {
-                    targetCall?.let {
-                        it.reject(false, null)
-                        Log.d(TAG, "Rejected call via Mac instruction")
-                    }
-                }
-                "hangup" -> {
-                    targetCall?.let {
-                        it.disconnect()
-                        Log.d(TAG, "Hung up call via Mac instruction")
-                    }
-                }
-                "dtmf" -> {
-                    payload.dtmfDigit?.firstOrNull()?.let { digit ->
-                        targetCall?.playDtmfTone(digit)
-                        targetCall?.stopDtmfTone()
-                        Log.d(TAG, "Played DTMF tone: $digit")
-                    }
+        fun executeCallAction(payload: CallActionPayload, onResult: (String?) -> Unit) {
+            Handler(Looper.getMainLooper()).post {
+                val service = activeInstance
+                if (service == null) {
+                    onResult("Call controls are unavailable. Open the Android companion and enable call controls for your Mac.")
+                } else {
+                    try { onResult(service.performAction(payload)) }
+                    catch (e: Exception) { onResult(e.message ?: "The phone rejected the call command.") }
                 }
             }
         }
+
+        fun syncCurrentCalls() {
+            Handler(Looper.getMainLooper()).post {
+                activeInstance?.let { service -> service.activeCalls.forEach { (id, call) -> service.publishCall(id, call) } }
+            }
+        }
+
+        fun isBluetoothAudioConnected(): Boolean =
+            activeInstance?.audioRoute == CallAudioState.ROUTE_BLUETOOTH
+    }
+
+    private fun performAction(payload: CallActionPayload): String? {
+        // A stale ID must never act on an unrelated call (including call waiting).
+        val call = if (payload.callId != null) activeCalls[payload.callId] else activeCalls.values.singleOrNull()
+        if (call == null) return "This call is no longer available on the phone."
+        when (payload.action) {
+            "answer" -> {
+                if (call.state != Call.STATE_RINGING) return "The call is no longer ringing."
+                call.answer(VideoProfile.STATE_AUDIO_ONLY)
+            }
+            "reject" -> {
+                if (call.state != Call.STATE_RINGING) return "The call is no longer ringing."
+                call.reject(false, null)
+            }
+            "hangup" -> call.disconnect()
+            "mute" -> setMuted(true)
+            "unmute" -> setMuted(false)
+            "dtmf" -> {
+                val digit = payload.dtmfDigit?.singleOrNull()
+                if (digit == null || digit !in "0123456789*#ABCD" || call.state != Call.STATE_ACTIVE) {
+                    return "Touch tones require an active call and a valid keypad digit."
+                }
+                dtmfStops.remove(call)?.let(handler::removeCallbacks)
+                call.playDtmfTone(digit)
+                val stop = Runnable { call.stopDtmfTone(); dtmfStops.remove(call) }
+                dtmfStops[call] = stop
+                handler.postDelayed(stop, 180)
+            }
+            "audio_phone" -> setAudioRoute(CallAudioState.ROUTE_WIRED_OR_EARPIECE)
+            "audio_speaker" -> setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+            "audio_bluetooth" -> return routeAudioToMac()
+            else -> return "Unsupported call command: ${payload.action}"
+        }
+        return null
     }
 
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         activeInstance = this
-        val callId = call.hashCode().toString()
-        activeCalls[callId] = call
-
-        call.registerCallback(object : Call.Callback() {
-            override fun onStateChanged(call: Call, state: Int) {
-                handleCallStateChange(callId, call, state)
-            }
-        })
-
-        handleCallStateChange(callId, call, call.state)
+        val id = UUID.randomUUID().toString()
+        ids[call] = id
+        activeCalls[id] = call
+        val callback = object : Call.Callback() {
+            override fun onStateChanged(call: Call, state: Int) = publishCall(id, call)
+            override fun onDetailsChanged(call: Call, details: Call.Details) = publishCall(id, call)
+        }
+        callbacks[call] = callback
+        call.registerCallback(callback, handler)
+        publishCall(id, call)
     }
 
     override fun onCallRemoved(call: Call) {
+        val id = ids.remove(call)
+        if (id != null) {
+            if (id !in reportedEnded) publishCall(id, call, forceEnded = true)
+            activeCalls.remove(id)
+            reportedEnded.remove(id)
+        }
+        callbacks.remove(call)?.let(call::unregisterCallback)
+        dtmfStops.remove(call)?.let(handler::removeCallbacks)
         super.onCallRemoved(call)
-        val callId = call.hashCode().toString()
-        activeCalls.remove(callId)
+        if (activeCalls.isEmpty()) activeInstance = null
+    }
 
-        val phoneCall = PhoneCall(
-            id = callId,
-            phoneNumber = getPhoneNumber(call),
-            contactName = getCallerName(call),
-            state = "ended"
+    override fun onDestroy() {
+        callbacks.forEach { (call, callback) -> call.unregisterCallback(callback) }
+        handler.removeCallbacksAndMessages(null)
+        callbacks.clear()
+        activeCalls.clear()
+        ids.clear()
+        if (activeInstance === this) activeInstance = null
+        super.onDestroy()
+    }
+
+    override fun onCallAudioStateChanged(state: CallAudioState) {
+        super.onCallAudioStateChanged(state)
+        muted = state.isMuted
+        audioRoute = state.route
+        activeCalls.forEach { (id, call) -> if (id !in reportedEnded) publishCall(id, call) }
+    }
+
+    private fun publishCall(id: String, call: Call, forceEnded: Boolean = false) {
+        val details = call.details
+        val ended = forceEnded || call.state == Call.STATE_DISCONNECTED
+        if (ended) reportedEnded.add(id)
+        val state = if (ended) {
+            when (details?.disconnectCause?.code) {
+                DisconnectCause.MISSED -> "missed"
+                DisconnectCause.REJECTED -> "rejected"
+                else -> "ended"
+            }
+        } else when (call.state) {
+            Call.STATE_RINGING -> "incoming"
+            Call.STATE_DIALING, Call.STATE_CONNECTING, Call.STATE_SELECT_PHONE_ACCOUNT, Call.STATE_NEW -> "dialing"
+            Call.STATE_ACTIVE -> "active"
+            Call.STATE_HOLDING -> "held"
+            else -> return
+        }
+        val number = details?.handle?.schemeSpecificPart ?: "Unknown"
+        val connectedAt = details?.connectTimeMillis?.takeIf { it > 0 }
+        val payload = PhoneCall(
+            id = id, phoneNumber = number,
+            contactName = details?.callerDisplayName?.takeIf { it.isNotBlank() } ?: number,
+            state = state,
+            direction = if (details?.callDirection == Call.Details.DIRECTION_OUTGOING) "outgoing" else "incoming",
+            startTime = connectedAt ?: if (ended) details?.creationTimeMillis else null,
+            duration = connectedAt?.let { ((System.currentTimeMillis() - it).coerceAtLeast(0)) / 1000.0 } ?: 0.0,
+            isMuted = muted, isSpeaker = audioRoute == CallAudioState.ROUTE_SPEAKER
         )
-        sendCallUpdate(EnvelopeTypes.CALL_STATE_UPDATE, phoneCall)
+        ConnectionManager.getInstance(applicationContext).sendEnvelope(MessageEnvelope(
+            type = if (state == "incoming") EnvelopeTypes.CALL_INCOMING else EnvelopeTypes.CALL_STATE_UPDATE,
+            payload = Gson().toJson(payload)
+        ))
+    }
 
-        if (activeCalls.isEmpty()) {
-            activeInstance = null
+    @Suppress("DEPRECATION")
+    private fun routeAudioToMac(): String? {
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            return "Grant Nearby Devices permission on the phone to select Bluetooth call audio."
         }
-    }
-
-    private fun handleCallStateChange(callId: String, call: Call, state: Int) {
-        val number = getPhoneNumber(call)
-        val name = getCallerName(call)
-
-        when (state) {
-            Call.STATE_RINGING -> {
-                val phoneCall = PhoneCall(
-                    id = callId,
-                    phoneNumber = number,
-                    contactName = name,
-                    state = "incoming",
-                    direction = "incoming"
-                )
-                sendCallUpdate(EnvelopeTypes.CALL_INCOMING, phoneCall)
-            }
-            Call.STATE_DIALING, Call.STATE_CONNECTING -> {
-                val phoneCall = PhoneCall(
-                    id = callId,
-                    phoneNumber = number,
-                    contactName = name,
-                    state = "dialing",
-                    direction = "outgoing"
-                )
-                sendCallUpdate(EnvelopeTypes.CALL_STATE_UPDATE, phoneCall)
-            }
-            Call.STATE_ACTIVE -> {
-                routeAudioToBluetooth()
-                val phoneCall = PhoneCall(
-                    id = callId,
-                    phoneNumber = number,
-                    contactName = name,
-                    state = "active",
-                    startTime = System.currentTimeMillis()
-                )
-                sendCallUpdate(EnvelopeTypes.CALL_STATE_UPDATE, phoneCall)
-            }
-            Call.STATE_DISCONNECTED -> {
-                val phoneCall = PhoneCall(
-                    id = callId,
-                    phoneNumber = number,
-                    contactName = name,
-                    state = "ended"
-                )
-                sendCallUpdate(EnvelopeTypes.CALL_STATE_UPDATE, phoneCall)
-            }
+        val address = getSharedPreferences("call_setup", MODE_PRIVATE).getString("macAddress", null)
+            ?: return "Start Bluetooth pairing from the Mac, then pair the Mac in Android Bluetooth settings."
+        return try {
+            val device = callAudioState?.supportedBluetoothDevices?.firstOrNull { it.address.equals(address, true) }
+                ?: return "The Mac is not connected as a Bluetooth call-audio device. Check the phone's Bluetooth settings."
+            requestBluetoothAudio(device)
+            null
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Bluetooth audio permission was revoked", e)
+            "Bluetooth permission is unavailable."
         }
-    }
-
-    fun routeAudioToBluetooth() {
-        try {
-            setAudioRoute(CallAudioState.ROUTE_BLUETOOTH)
-            Log.d(TAG, "Audio routed to Bluetooth Hands-Free device")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to route audio to Bluetooth", e)
-        }
-    }
-
-    private fun getPhoneNumber(call: Call): String {
-        return call.details?.handle?.schemeSpecificPart ?: "Unknown"
-    }
-
-    private fun getCallerName(call: Call): String {
-        val displayName = call.details?.callerDisplayName
-        return if (!displayName.isNullOrBlank()) displayName else getPhoneNumber(call)
-    }
-
-    private fun sendCallUpdate(type: String, call: PhoneCall) {
-        val envelope = MessageEnvelope(
-            type = type,
-            payload = Gson().toJson(call)
-        )
-        ConnectionManager.getInstance(applicationContext).sendEnvelope(envelope)
     }
 }

@@ -14,14 +14,21 @@ data class MessageEnvelope(
 object EnvelopeTypes {
     const val PAIRING_REQUEST = "pairing_request"
     const val PAIRING_RESPONSE = "pairing_response"
+    const val TRANSPORT_PROBE = "transport_probe"
+    const val TRANSPORT_ENDPOINTS = "transport_endpoints"
+    const val ENVELOPE_ACK = "envelope_ack"
     const val HEARTBEAT = "heartbeat"
     const val CHAT_MESSAGE = "chat_message"
     const val CHAT_SYNC = "chat_sync"
+    const val CHAT_CAPABILITIES = "chat_capabilities"
+    const val ATTACHMENT_REQUEST = "attachment_request"
+    const val ATTACHMENT_DATA = "attachment_data"
     const val CHAT_SEND = "chat_send"
     const val CHAT_STATUS_UPDATE = "chat_status_update"
     const val CALL_SYNC = "call_sync"
     const val CALL_INCOMING = "call_incoming"
     const val CALL_STATE_UPDATE = "call_state_update"
+    const val CALL_ACTION_RESULT = "call_action_result"
     const val CALL_ACTION = "call_action"
     const val BLUETOOTH_PAIR_REQUEST = "bluetooth_pair_request"
     const val BLUETOOTH_PAIR_RESPONSE = "bluetooth_pair_response"
@@ -32,7 +39,9 @@ object EnvelopeTypes {
     const val NOTIFICATION_SYNC = "notification_sync"
     const val NOTIFICATION_POSTED = "notification_posted"
     const val NOTIFICATION_REMOVED = "notification_removed"
+    const val MEDIA_CONTROL = "media_control"
     const val NOTIFICATION_DISMISS = "notification_dismiss"
+    const val UNPAIR = "unpair"
 }
 
 // MARK: - Pairing Models
@@ -69,15 +78,19 @@ data class ChatMessage(
     @SerializedName("status") val status: String = "sent",
     @SerializedName("messageType") val messageType: String = "RCS",
     @SerializedName("attachmentUrl") val attachmentUrl: String? = null,
-    @SerializedName("attachmentMimeType") val attachmentMimeType: String? = null
+    @SerializedName("attachmentMimeType") val attachmentMimeType: String? = null,
+    @SerializedName("attachments") val attachments: List<MessageAttachment> = emptyList()
 )
+
+data class MessageAttachment(val url: String, val mimeType: String)
 
 data class OutgoingMessageRequest(
     @SerializedName("id") val id: String,
     @SerializedName("threadId") val threadId: String,
     @SerializedName("recipient") val recipient: String,
     @SerializedName("text") val text: String,
-    @SerializedName("preferRcs") val preferRcs: Boolean = true
+    @SerializedName("preferRcs") val preferRcs: Boolean = true,
+    @SerializedName("imageBase64") val imageBase64: String? = null
 )
 
 // MARK: - Phone Calls
@@ -139,5 +152,6 @@ data class AppNotification(
     @SerializedName("timestamp") val timestamp: Long = System.currentTimeMillis(),
     @SerializedName("iconBase64") val iconBase64: String? = null,
     @SerializedName("canReply") val canReply: Boolean = false,
-    @SerializedName("isClearable") val isClearable: Boolean = true
+    @SerializedName("isClearable") val isClearable: Boolean = true,
+    @SerializedName("isMediaPlayback") val isMediaPlayback: Boolean = false
 )

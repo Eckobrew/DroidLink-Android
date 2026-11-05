@@ -16,8 +16,10 @@ import com.droiddock.companion.network.EnvelopeTypes
 import com.droiddock.companion.network.MessageEnvelope
 import com.google.gson.Gson
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.*
 
 class RcsNotificationListenerService : NotificationListenerService() {
+    private val imageScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
         private const val TAG = "DroidDockRCS"
@@ -41,6 +43,16 @@ class RcsNotificationListenerService : NotificationListenerService() {
             }
         })
 
+        fun syncStoredImages(context: Context) {
+            val gson = Gson()
+            val messages = context.getSharedPreferences("received_image_messages", Context.MODE_PRIVATE).all.values
+                .mapNotNull { value -> try { gson.fromJson(value as? String, ChatMessage::class.java) } catch (_: Exception) { null } }
+            for (chunk in messages.chunked(50)) {
+                ConnectionManager.getInstance(context).sendEnvelope(MessageEnvelope(
+                    type = EnvelopeTypes.CHAT_SYNC, payload = gson.toJson(chunk)))
+            }
+        }
+
         fun replyToRcsConversation(context: Context, threadOrSender: String, text: String): Boolean {
             val contactsHelper = ContactsHelper(context)
             val resolvedName = contactsHelper.resolveContactName(threadOrSender)
@@ -49,25 +61,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
 
             Log.d(TAG, "Attempting RCS reply for: '$threadOrSender' (resolved: '$resolvedName', clean: '$clean')")
 
-            // 1. Look up in cachedReplyActions with all key variations
-            var action: Notification.Action? = cachedReplyActions[threadOrSender]
-                ?: cachedReplyActions[clean]
-                ?: cachedReplyActions[resolvedName]
-                ?: cachedReplyActions[resolvedName.lowercase()]
-
-            if (action == null && suffix.isNotEmpty()) {
-                for ((key, act) in cachedReplyActions) {
-                    if (key.endsWith(suffix) || suffix.endsWith(key) || key.equals(resolvedName, ignoreCase = true)) {
-                        action = act
-                        break
-                    }
-                }
-            }
-
-            // 2. If not found in cache, scan active status bar notifications directly
-            if (action == null) {
-                action = findActionInActiveNotifications(threadOrSender, resolvedName, clean, suffix)
-            }
+            val action = findActionInActiveNotifications(threadOrSender, resolvedName, clean, suffix)
 
             if (action == null) {
                 Log.w(TAG, "No active RCS reply action found for $threadOrSender ($resolvedName)")
@@ -97,6 +91,12 @@ class RcsNotificationListenerService : NotificationListenerService() {
             }
         }
 
+        fun canReplyToConversation(context: Context, address: String): Boolean {
+            val clean = cleanNumber(address)
+            return findActionInActiveNotifications(address, ContactsHelper(context).resolveContactName(address),
+                clean, clean.takeLast(7)) != null
+        }
+
         private fun findActionInActiveNotifications(
             target: String,
             name: String,
@@ -114,16 +114,17 @@ class RcsNotificationListenerService : NotificationListenerService() {
                     val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
                     val convTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString() ?: ""
 
-                    val matches = title.contains(target, ignoreCase = true) ||
-                            title.contains(name, ignoreCase = true) ||
-                            convTitle.contains(target, ignoreCase = true) ||
-                            convTitle.contains(name, ignoreCase = true) ||
-                            (clean.isNotEmpty() && cleanNumber(title).endsWith(suffix))
+                    val candidates = listOf(title, convTitle).filter { it.isNotBlank() }
+                    val matches = candidates.any { candidate ->
+                        candidate.equals(target, ignoreCase = true) ||
+                        (name.isNotBlank() && candidate.equals(name, ignoreCase = true)) ||
+                        (clean.length >= 7 && cleanNumber(candidate).length >= 7 && cleanNumber(candidate).endsWith(suffix))
+                    }
 
                     if (matches) {
                         val actions = sbn.notification.actions ?: continue
                         for (act in actions) {
-                            if (!act.remoteInputs.isNullOrEmpty()) {
+                            if (act.remoteInputs?.any { it.allowFreeFormInput } == true) {
                                 // Cache for future lookups
                                 cacheAction(act, title, name, clean)
                                 return act
@@ -173,6 +174,59 @@ class RcsNotificationListenerService : NotificationListenerService() {
             }
         }
 
+        fun isSystemNoiseNotification(title: String, text: String, pkg: String, isOngoing: Boolean, canReply: Boolean): Boolean {
+            val t = title.lowercase().trim()
+            val txt = text.lowercase().trim()
+            val isMsg = pkg.contains("messaging") || pkg == "com.google.android.apps.messaging" || pkg.contains("mms")
+
+            if (t == "device pairing" || t == "pairing code" || t.contains("device pairing")) return true
+            if (txt.contains("messages is doing work") || txt.contains("doing work in the background")) return true
+            if (txt.contains("your messages are available") || txt.contains("pairing with")) return true
+            if (txt.contains("chat features") || txt.contains("rcs chats")) return true
+            if (txt.contains("connected to messages for web")) return true
+            if (isMsg && (t == "messages" || t == "unknown" || t.isEmpty()) && !canReply) return true
+            if (isMsg && isOngoing && !canReply) return true
+
+            return false
+        }
+
+        fun isControllableMediaNotification(sbn: StatusBarNotification): Boolean {
+            val extras = sbn.notification.extras ?: return false
+            val hasMediaSession = extras.containsKey(Notification.EXTRA_MEDIA_SESSION) ||
+                    extras.containsKey("android.mediaSession")
+            val isTransportCategory = sbn.notification.category == Notification.CATEGORY_TRANSPORT
+            val hasMediaActions = sbn.notification.actions?.any { act ->
+                val at = act.title?.toString()?.lowercase() ?: ""
+                at.contains("pause") || at.contains("play") || at.contains("previous") || at.contains("next")
+            } == true
+
+            return hasMediaSession || isTransportCategory || (sbn.isOngoing && hasMediaActions)
+        }
+
+        fun controlMedia(context: Context, action: String) {
+            if (activeInstance == null) return
+            val manager = context.getSystemService(android.media.session.MediaSessionManager::class.java)
+            val component = android.content.ComponentName(context, RcsNotificationListenerService::class.java)
+            try {
+                val controllers = manager.getActiveSessions(component)
+                val controller = controllers.firstOrNull {
+                    it.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
+                } ?: controllers.firstOrNull() ?: return
+                val controls = controller.transportControls
+                when (action) {
+                    "play_pause" -> if (controller.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING) {
+                        controls.pause()
+                    } else { controls.play() }
+                    "next" -> controls.skipToNext()
+                    "previous" -> controls.skipToPrevious()
+                    "volume_up" -> controller.adjustVolume(android.media.AudioManager.ADJUST_RAISE, 0)
+                    "volume_down" -> controller.adjustVolume(android.media.AudioManager.ADJUST_LOWER, 0)
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Notification access is required for media controls", e)
+            }
+        }
+
         fun syncAllActiveNotifications(context: Context) {
             val instance = activeInstance ?: return
             try {
@@ -181,6 +235,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
                 val pm = context.packageManager
 
                 for (sbn in sbns) {
+                    if (sbn.packageName == context.packageName) continue
                     if ((sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) continue
                     val extras = sbn.notification.extras ?: continue
                     val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
@@ -189,6 +244,13 @@ class RcsNotificationListenerService : NotificationListenerService() {
                         ?: ""
                     if (title.isBlank() && text.isBlank()) continue
 
+                    var canReply = false
+                    sbn.notification.actions?.forEach { act ->
+                        if (!act.remoteInputs.isNullOrEmpty()) canReply = true
+                    }
+
+                    if (isSystemNoiseNotification(title, text, sbn.packageName, sbn.isOngoing, canReply)) continue
+
                     val appName = try {
                         val appInfo = pm.getApplicationInfo(sbn.packageName, 0)
                         pm.getApplicationLabel(appInfo).toString()
@@ -196,12 +258,8 @@ class RcsNotificationListenerService : NotificationListenerService() {
                         sbn.packageName
                     }
 
-                    var canReply = false
-                    sbn.notification.actions?.forEach { act ->
-                        if (!act.remoteInputs.isNullOrEmpty()) canReply = true
-                    }
-
                     val artworkBase64 = extractArtworkBase64(context, sbn)
+                    val isMedia = isControllableMediaNotification(sbn)
                     notifs.add(
                         AppNotification(
                             id = sbn.key,
@@ -213,7 +271,8 @@ class RcsNotificationListenerService : NotificationListenerService() {
                             timestamp = sbn.postTime,
                             iconBase64 = artworkBase64,
                             canReply = canReply,
-                            isClearable = sbn.isClearable
+                            isClearable = sbn.isClearable,
+                            isMediaPlayback = isMedia
                         )
                     )
                 }
@@ -267,6 +326,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
     }
 
     override fun onDestroy() {
+        imageScope.cancel()
         if (activeInstance == this) {
             activeInstance = null
         }
@@ -300,7 +360,79 @@ class RcsNotificationListenerService : NotificationListenerService() {
         ConnectionManager.getInstance(applicationContext).sendEnvelope(envelope)
     }
 
+    private fun forwardNotificationImages(sbn: StatusBarNotification, title: String) {
+        val style = androidx.core.app.NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(sbn.notification)
+        val imageMessages = style?.messages?.filter { it.dataUri != null && it.dataMimeType?.startsWith("image/") == true } ?: emptyList()
+        val hasPicture = sbn.notification.extras.containsKey(Notification.EXTRA_PICTURE)
+        if (imageMessages.isEmpty() && !hasPicture) return
+        fun send(localUrl: String, timestamp: Long, sender: String, text: String) {
+            if (sender.isBlank()) return
+            val groupTitle = style?.conversationTitle?.toString()?.takeIf { it.isNotBlank() } ?: title
+            val isGroup = style?.isGroupConversation == true
+            val threadId = if (isGroup) "notification_group_" + java.security.MessageDigest.getInstance("SHA-256")
+                .digest("${sbn.packageName}:$groupTitle".toByteArray()).joinToString("") { "%02x".format(it) } else sender
+            val image = ChatMessage(
+                id = "notification_image_" + localUrl.substringAfter(":"), threadId = threadId,
+                senderName = if (isGroup) groupTitle else title, senderAddress = if (isGroup) groupTitle else sender, isFromMe = false,
+                text = text, timestamp = timestamp, status = "delivered", messageType = "Unconfirmed",
+                attachments = listOf(com.droiddock.companion.network.MessageAttachment(localUrl, "image/jpeg")))
+            val json = Gson().toJson(image)
+            synchronized(ImageMessages) {
+                val prefs = getSharedPreferences("received_image_messages", MODE_PRIVATE)
+                prefs.edit().putString(image.id, json).apply()
+                // Retain a bounded received-image history, including images received while offline.
+                if (prefs.all.size > 200) {
+                    val oldest = prefs.all.mapNotNull { (key, value) ->
+                        try {
+                            val stored = Gson().fromJson(value as? String, ChatMessage::class.java)
+                            if (stored == null) null else key to stored
+                        } catch (_: Exception) { null }
+                    }.minByOrNull { it.second.timestamp }
+                    if (oldest != null) {
+                        prefs.edit().remove(oldest.first).apply()
+                        oldest.second.attachments.forEach { attachment ->
+                            val key = attachment.url.removePrefix("notification-image:")
+                            if (Regex("[a-f0-9]{64}").matches(key)) java.io.File(java.io.File(filesDir, "received_images"), "$key.jpg").delete()
+                        }
+                    }
+                }
+            }
+            ConnectionManager.getInstance(applicationContext).sendEnvelope(MessageEnvelope(
+                type = EnvelopeTypes.CHAT_MESSAGE, payload = json))
+        }
+        for (message in imageMessages) {
+            if (message.dataUri?.authority == "mms") {
+                ConnectionManager.getInstance(applicationContext).syncRecentMessages()
+                continue
+            }
+            // A null sender represents the current user, rather than a new incoming image.
+            if (message.person == null) continue
+            try {
+                val url = ImageMessages.captureNotificationImage(applicationContext, message.dataUri!!,
+                    "${sbn.key}:${message.timestamp}:${message.dataUri}")
+                val sender = message.person?.uri?.takeIf { it.startsWith("tel:") }?.removePrefix("tel:") ?: title
+                send(url, message.timestamp, sender, message.text?.toString() ?: "")
+            } catch (e: Exception) { Log.w(TAG, "Messaging app did not expose a readable image", e) }
+        }
+        if (imageMessages.isEmpty()) {
+            // BigPicture is another public notification representation of an incoming image.
+            val bitmap = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                sbn.notification.extras.getParcelable(Notification.EXTRA_PICTURE, android.graphics.Bitmap::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                sbn.notification.extras.getParcelable<android.graphics.Bitmap>(Notification.EXTRA_PICTURE)
+            }
+            if (bitmap != null) {
+                try {
+                    val url = ImageMessages.captureNotificationBitmap(applicationContext, bitmap, "${sbn.key}:${sbn.postTime}")
+                    send(url, sbn.postTime, title, "")
+                } catch (e: Exception) { Log.w(TAG, "Notification photo was unavailable", e) }
+            }
+        }
+    }
+
     private fun processNotification(sbn: StatusBarNotification) {
+        if (sbn.packageName == packageName) return
         val pkg = sbn.packageName
         if ((sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
 
@@ -338,54 +470,30 @@ class RcsNotificationListenerService : NotificationListenerService() {
         }
 
         // Filter out Google Messages internal background tasks, pairing status, and system noise
-        val isSystemNoise = title.equals("Device pairing", ignoreCase = true) ||
-                (title.equals("Messages", ignoreCase = true) && !canReply) ||
-                title.equals("Unknown", ignoreCase = true) ||
-                cleanText.contains("Messages is doing work", ignoreCase = true) ||
-                cleanText.contains("Your messages are available", ignoreCase = true) ||
-                cleanText.contains("pairing with", ignoreCase = true) ||
-                cleanText.contains("Chat features", ignoreCase = true) ||
-                cleanText.contains("RCS chats", ignoreCase = true)
-
-        if (isSystemNoise) {
+        if (isSystemNoiseNotification(title, cleanText, pkg, sbn.isOngoing, canReply)) {
             Log.d(TAG, "Ignoring Google Messages background service notification: '$title' / '$cleanText'")
             return
         }
 
-        // 1. If messaging app, handle RCS/SMS chat pipeline ONLY for real user messages with reply capability
+        // 1. If messaging app, cache action for RemoteInput reply and trigger fast database sync
         if (isMessagingApp && cleanText.isNotEmpty() && !sbn.isOngoing && canReply) {
             val sender = if (title.isNotBlank()) title else "Unknown"
             val contactsHelper = ContactsHelper(applicationContext)
             val resolvedName = contactsHelper.resolveContactName(sender)
 
-            val contactMap = contactsHelper.getContactMap()
-            var matchedPhone: String? = null
-            for ((phone, name) in contactMap) {
-                if (name.equals(sender, ignoreCase = true) || name.equals(resolvedName, ignoreCase = true)) {
-                    matchedPhone = phone
-                    break
-                }
+            val replyAction = actions?.firstOrNull { !it.remoteInputs.isNullOrEmpty() }
+            if (replyAction != null) {
+                cacheAction(replyAction, sender, resolvedName, null)
             }
-            val threadAddress = matchedPhone ?: sender
 
-            val msgFingerprint = "msg:$threadAddress:$cleanText:${sbn.postTime / 10000}"
-            if (recentNotificationFingerprints.add(msgFingerprint)) {
-                val chatMessage = ChatMessage(
-                    id = sbn.key,
-                    threadId = threadAddress,
-                    senderName = if (resolvedName.isNotBlank() && resolvedName != "Unknown") resolvedName else sender,
-                    senderAddress = threadAddress,
-                    isFromMe = false,
-                    text = cleanText,
-                    timestamp = sbn.postTime,
-                    status = "delivered",
-                    messageType = if (canReply) "RCS" else "SMS"
-                )
-                val chatEnv = MessageEnvelope(
-                    type = EnvelopeTypes.CHAT_MESSAGE,
-                    payload = Gson().toJson(chatMessage)
-                )
-                ConnectionManager.getInstance(applicationContext).sendEnvelope(chatEnv)
+            // Sync authoritative message directly from telephony provider to avoid duplicate synthetic messages
+            ConnectionManager.getInstance(applicationContext).syncRecentMessages()
+        }
+
+        if (isMessagingApp && !sbn.isOngoing) {
+            imageScope.launch {
+                try { forwardNotificationImages(sbn, title) }
+                catch (e: Exception) { Log.w(TAG, "Could not inspect notification images", e) }
             }
         }
 
@@ -403,6 +511,7 @@ class RcsNotificationListenerService : NotificationListenerService() {
         }
 
         val artworkBase64 = extractArtworkBase64(applicationContext, sbn)
+        val isMedia = isControllableMediaNotification(sbn)
 
         val appNotification = AppNotification(
             id = sbn.key,
@@ -414,7 +523,8 @@ class RcsNotificationListenerService : NotificationListenerService() {
             timestamp = sbn.postTime,
             iconBase64 = artworkBase64,
             canReply = canReply,
-            isClearable = sbn.isClearable
+            isClearable = sbn.isClearable,
+            isMediaPlayback = isMedia
         )
 
         val notifEnvelope = MessageEnvelope(

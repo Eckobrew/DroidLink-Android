@@ -2,6 +2,8 @@ package com.droiddock.companion.ui
 
 import android.content.Intent
 import android.provider.Settings
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -26,18 +28,15 @@ fun DashboardScreen(
 ) {
     val context = LocalContext.current
     val connMgr = remember { ConnectionManager.getInstance(context) }
-    var connectionState by remember { mutableStateOf("wifi") }
-
-    LaunchedEffect(Unit) {
-        connMgr.onConnectionStateChanged = { state ->
-            connectionState = state
-        }
-    }
+    val connectionState by connMgr.transport.collectAsState()
+    val bluetoothStatus by connMgr.bluetoothStatus.collectAsState()
+    var fallbackEnabled by remember { mutableStateOf(connMgr.bluetoothFallbackEnabled) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(20.dp),
+            .padding(20.dp)
+            .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // Top Connection Status Card
@@ -66,18 +65,30 @@ fun DashboardScreen(
                 }
 
                 Text(
-                    text = "Active Transport: ${connectionState.uppercase()} with Bluetooth fallback",
+                    text = if (connectionState != "disconnected") "Active Transport: ${connectionState.uppercase()}" else "Status: Waiting for Wi-Fi or Bluetooth",
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 Text(
-                    text = "End-to-End Encryption: ECDH P-256 + AES-256-GCM Active",
+                    text = if (connectionState != "disconnected") "End-to-End Encryption: ECDH P-256 + AES-256-GCM Active" else "Keep the Mac app open; enable Nearby Devices for Bluetooth fallback",
                     fontSize = 12.sp,
-                    color = Color(0xFF2E7D32),
+                    color = if (connectionState != "disconnected") Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                     fontWeight = FontWeight.Medium
                 )
             }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Bluetooth data fallback", fontWeight = FontWeight.Medium)
+                Text(bluetoothStatus, fontSize = 12.sp)
+            }
+            TextButton(onClick = { connMgr.retryBluetoothConnection() }, enabled = fallbackEnabled) { Text("Retry") }
+            Switch(checked = fallbackEnabled, onCheckedChange = {
+                fallbackEnabled = it
+                connMgr.setBluetoothFallbackEnabled(it)
+            })
         }
 
         Text(
@@ -98,16 +109,11 @@ fun DashboardScreen(
             }
         )
 
-        // Phone Calls & Telecom Card
-        ServiceStatusRow(
-            icon = Icons.Default.Phone,
-            title = "Bluetooth Telephony Handset",
-            subtitle = "Answers and initiates calls from your Mac",
-            actionLabel = "Telecom Settings",
-            onAction = {
-                context.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
-            }
-        )
+        CallSetupCard()
+
+        OutlinedButton(onClick = {
+            context.startActivity(Intent(context, com.droiddock.companion.messages.ImageComposeActivity::class.java))
+        }) { Text("Open pending image message") }
 
         // Handset Audio Routing Card
         ServiceStatusRow(
@@ -120,7 +126,7 @@ fun DashboardScreen(
             }
         )
 
-        Spacer(modifier = Modifier.weight(1f))
+        Spacer(modifier = Modifier.height(12.dp))
 
         OutlinedButton(
             onClick = {

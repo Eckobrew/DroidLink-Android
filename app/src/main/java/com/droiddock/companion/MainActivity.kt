@@ -35,6 +35,7 @@ class MainActivity : ComponentActivity() {
         requestRequiredPermissions()
 
         val secureStorage = SecureStorage(this)
+        if (secureStorage.getStoredPeerPublicKey() != null) startConnectionService()
 
         setContent {
             DroidDockTheme {
@@ -54,13 +55,14 @@ class MainActivity : ComponentActivity() {
                         if (isPaired) {
                             DashboardScreen(
                                 onUnpair = {
-                                    secureStorage.clearAll()
+                                    com.droiddock.companion.network.ConnectionManager.getInstance(this@MainActivity).unpair()
                                     isPaired = false
                                 }
                             )
                         } else {
                             PairingScreen(
                                 onPairingSuccess = {
+                                    startConnectionService()
                                     isPaired = true
                                 }
                             )
@@ -69,6 +71,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun startConnectionService() {
+        try {
+            ContextCompat.startForegroundService(this, android.content.Intent(this,
+                com.droiddock.companion.network.ConnectionService::class.java))
+        } catch (e: Exception) { android.util.Log.w("DroidDock", "Connection service could not start", e) }
     }
 
     private fun requestRequiredPermissions() {

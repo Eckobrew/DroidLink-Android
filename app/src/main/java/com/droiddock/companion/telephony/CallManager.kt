@@ -19,22 +19,15 @@ class CallManager(private val context: Context) {
     private val contactsHelper = ContactsHelper(context)
 
     fun placeCall(phoneNumber: String): Boolean {
+        if (phoneNumber.isBlank()) return false
+        if (context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) != android.content.pm.PackageManager.PERMISSION_GRANTED) return false
+        val telecom = telecomManager ?: return false
+        if (!telecom.hasManageOngoingCallsPermission() && telecom.defaultDialerPackage != context.packageName) return false
         return try {
-            val uri = Uri.fromParts("tel", phoneNumber, null)
-            if (context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                telecomManager?.placeCall(uri, null)
-                Log.d(TAG, "Placed call to $phoneNumber via TelecomManager")
-                true
-            } else {
-                val intent = Intent(Intent.ACTION_CALL, uri).apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                }
-                context.startActivity(intent)
-                Log.d(TAG, "Placed call to $phoneNumber via Intent.ACTION_CALL")
-                true
-            }
+            telecom.placeCall(Uri.fromParts("tel", phoneNumber, null), null)
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to place call to $phoneNumber", e)
+            Log.e(TAG, "Phone rejected call request", e)
             false
         }
     }
