@@ -7,19 +7,23 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -50,34 +54,69 @@ fun PairingScreen(
     var statusText by remember { mutableStateOf("Point your camera at the Mac QR code") }
     var scanCompleted by remember { mutableStateOf(false) }
 
+    // Subtle scanline pulse animation
+    val infiniteTransition = rememberInfiniteTransition(label = "scanner")
+    val scanProgress by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "scanProgress"
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(4.dp))
 
-        Text(
-            text = "Link to Mac",
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Bold
-        )
+        // Brand Icon & Header
+        Surface(
+            modifier = Modifier.size(52.dp),
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.primaryContainer
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = Icons.Default.QrCodeScanner,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(30.dp)
+                )
+            }
+        }
 
-        Text(
-            text = "Pairing is performed strictly via QR code. Align the QR code displayed in Droid Link on your Mac within the frame.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                text = "Pair with Droid Link",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+
+            Text(
+                text = "Open Droid Link on your Mac, navigate to the Pairing screen, and align the QR code inside the frame below.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 12.dp)
+            )
+        }
 
         // Camera QR Viewfinder
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .clip(RoundedCornerShape(20.dp))
+                .clip(RoundedCornerShape(24.dp))
                 .background(Color.Black),
             contentAlignment = Alignment.Center
         ) {
@@ -161,57 +200,105 @@ fun PairingScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Scanning Reticle Frame Overlay
+            // High-tech Reticle Frame Overlay
+            val reticleColor = if (isPairing) Color(0xFF10B981) else Color.White.copy(alpha = 0.85f)
             Box(
                 modifier = Modifier
                     .size(240.dp)
-                    .border(BorderStroke(2.dp, if (isPairing) Color(0xFF2E7D32) else Color.White.copy(alpha = 0.8f)), RoundedCornerShape(16.dp))
-            )
-        }
-
-        // Status Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    .border(BorderStroke(2.5.dp, reticleColor), RoundedCornerShape(20.dp)),
+                contentAlignment = Alignment.TopCenter
             ) {
-                if (isPairing) {
-                    CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
-                } else {
-                    Icon(
-                        imageVector = Icons.Default.QrCodeScanner,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-                Text(
-                    text = statusText,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium
+                // Moving laser scanline
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.9f)
+                        .height(2.dp)
+                        .offset(y = (scanProgress * 236).dp)
+                        .background(
+                            Brush.horizontalGradient(
+                                colors = listOf(
+                                    Color.Transparent,
+                                    if (isPairing) Color(0xFF10B981) else Color(0xFF0EA5E9),
+                                    Color.Transparent
+                                )
+                            )
+                        )
                 )
             }
         }
 
-        // E2EE Fingerprint Badge
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Icon(imageVector = Icons.Default.Lock, contentDescription = null, tint = Color(0xFF2E7D32), modifier = Modifier.size(16.dp))
-            Text(
-                text = "Verification: ${connMgr.cryptoManager.verificationFingerprint}",
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+        // Live Status Card
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.elevatedCardColors(
+                containerColor = MaterialTheme.colorScheme.surface
             )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                if (isPairing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        strokeWidth = 2.5.dp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                } else {
+                    Surface(
+                        modifier = Modifier.size(36.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.Security,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = statusText,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
         }
 
-        Spacer(modifier = Modifier.height(4.dp))
+        // Security Verification Fingerprint
+        Surface(
+            shape = RoundedCornerShape(10.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = Color(0xFF10B981),
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = "Fingerprint: ${connMgr.cryptoManager.verificationFingerprint}",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(2.dp))
     }
 }
