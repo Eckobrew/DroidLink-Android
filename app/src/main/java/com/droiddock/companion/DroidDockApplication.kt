@@ -22,10 +22,10 @@ class DroidDockApplication : Application() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "DroidDock Connection Service",
+                "Connection status",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Maintains persistent end-to-end encrypted link with your Mac"
+                description = "Shows your connection to the Mac while Droid Link runs in the background"
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)

@@ -73,6 +73,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (SecureStorage(this).getStoredPeerPublicKey() != null) startConnectionService()
+    }
+
     private fun startConnectionService() {
         try {
             ContextCompat.startForegroundService(this, android.content.Intent(this,

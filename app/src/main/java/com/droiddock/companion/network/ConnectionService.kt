@@ -21,15 +21,21 @@ class ConnectionService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         fun notification(status: String) = NotificationCompat.Builder(this, DroidDockApplication.CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Droid Link connection")
-            .setContentText(status).setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).build()
+            .setContentTitle("Droid Link")
+            .setContentText(status)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(status))
+            .setContentIntent(open)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setShowWhen(false).setOngoing(true).setOnlyAlertOnce(true).build()
         ServiceCompat.startForeground(this, 7101, notification("Looking for your Mac"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         scope.launch {
             ConnectionManager.getInstance(applicationContext).transport.collect { transport ->
                 val text = when (transport) {
-                    "wifi" -> "Connected over Wi-Fi • Bluetooth fallback ready when available"
-                    "bluetooth" -> "Syncing over Bluetooth • Looking for Wi-Fi"
-                    else -> "Waiting for your Mac over Wi-Fi or Bluetooth"
+                    "wifi" -> "Connected over Wi-Fi"
+                    "bluetooth" -> "Connected over Bluetooth • Reconnecting to Wi-Fi"
+                    else -> "Looking for your Mac"
                 }
                 try { getSystemService(android.app.NotificationManager::class.java).notify(7101, notification(text)) }
                 catch (_: SecurityException) { /* Android still exposes foreground service status in Task Manager. */ }
