@@ -38,6 +38,8 @@ fun DashboardScreen(
     val context = LocalContext.current
     val connMgr = remember { ConnectionManager.getInstance(context) }
     val connectionState by connMgr.transport.collectAsState()
+    val mirrorState by com.droiddock.companion.mirroring.MirrorCoordinator.state.collectAsState()
+    val mirrorRequest by com.droiddock.companion.mirroring.MirrorCoordinator.pending.collectAsState()
     var fallbackEnabled by remember { mutableStateOf(connMgr.bluetoothFallbackEnabled) }
     var showUnpairDialog by remember { mutableStateOf(false) }
 
@@ -108,6 +110,24 @@ fun DashboardScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Spacer(modifier = Modifier.height(2.dp))
+
+            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Screen sharing", style = MaterialTheme.typography.titleMedium)
+                    Text(mirrorState, style = MaterialTheme.typography.bodyMedium)
+                    if (mirrorRequest != null) {
+                        Button(onClick = {
+                            context.startActivity(Intent(context, com.droiddock.companion.mirroring.MirrorConsentActivity::class.java)
+                                .putExtra("sessionId", mirrorRequest))
+                        }) { Text("Review sharing request") }
+                    }
+                    if (com.droiddock.companion.mirroring.MirrorCoordinator.activeSession != null) {
+                        Button(onClick = { com.droiddock.companion.mirroring.MirrorCoordinator.stop(context) }) { Text("Stop sharing") }
+                    }
+                    TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) { Text("Remote control settings") }
+                    Text("No Android debugging required. Start mirroring from your Mac, then approve it here.", style = MaterialTheme.typography.bodySmall)
+                }
+            }
 
             // 1. Hero Connection Status Card
             ElevatedCard(

@@ -20,6 +20,29 @@ import kotlinx.coroutines.*
 
 class RcsNotificationListenerService : NotificationListenerService() {
     private val imageScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mediaRefresh = android.os.Handler(android.os.Looper.getMainLooper())
+    private val mediaCallbacks = mutableMapOf<android.media.session.MediaController, android.media.session.MediaController.Callback>()
+    private val refreshMedia = Runnable { syncAllActiveNotifications(this) }
+    private val sessionListener = android.media.session.MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+        watchMediaControllers(controllers.orEmpty())
+    }
+    private fun watchMediaControllers(controllers: List<android.media.session.MediaController>) {
+        mediaCallbacks.forEach { (controller, callback) -> controller.unregisterCallback(callback) }
+        mediaCallbacks.clear()
+        for (controller in controllers) {
+            val callback = object : android.media.session.MediaController.Callback() {
+                override fun onPlaybackStateChanged(state: android.media.session.PlaybackState?) { scheduleMediaRefresh() }
+                override fun onSessionDestroyed() { scheduleMediaRefresh() }
+            }
+            controller.registerCallback(callback, mediaRefresh)
+            mediaCallbacks[controller] = callback
+        }
+        scheduleMediaRefresh()
+    }
+    private fun scheduleMediaRefresh() {
+        mediaRefresh.removeCallbacks(refreshMedia)
+        mediaRefresh.postDelayed(refreshMedia, 150)
+    }
 
     companion object {
         private const val TAG = "DroidDockRCS"
@@ -190,40 +213,43 @@ class RcsNotificationListenerService : NotificationListenerService() {
             return false
         }
 
-        fun isControllableMediaNotification(sbn: StatusBarNotification): Boolean {
-            val extras = sbn.notification.extras ?: return false
-            val hasMediaSession = extras.containsKey(Notification.EXTRA_MEDIA_SESSION) ||
-                    extras.containsKey("android.mediaSession")
-            val isTransportCategory = sbn.notification.category == Notification.CATEGORY_TRANSPORT
-            val hasMediaActions = sbn.notification.actions?.any { act ->
-                val at = act.title?.toString()?.lowercase() ?: ""
-                at.contains("pause") || at.contains("play") || at.contains("previous") || at.contains("next")
-            } == true
-
-            return hasMediaSession || isTransportCategory || (sbn.isOngoing && hasMediaActions)
+        private fun verifiedMediaController(context: Context, sbn: StatusBarNotification): android.media.session.MediaController? {
+            val extras = sbn.notification.extras ?: return null
+            val token = if (android.os.Build.VERSION.SDK_INT >= 33) extras.getParcelable(Notification.EXTRA_MEDIA_SESSION, android.media.session.MediaSession.Token::class.java)
+                else { @Suppress("DEPRECATION") extras.getParcelable<android.media.session.MediaSession.Token>(Notification.EXTRA_MEDIA_SESSION) }
+            if (token == null) return null
+            val component = android.content.ComponentName(context, RcsNotificationListenerService::class.java)
+            return try {
+                context.getSystemService(android.media.session.MediaSessionManager::class.java).getActiveSessions(component).firstOrNull {
+                    it.sessionToken == token && it.packageName == sbn.packageName &&
+                        MediaNotificationPolicy.isControllable(it.playbackState?.state, it.playbackState?.actions ?: 0)
+                }
+            } catch (_: SecurityException) { null }
         }
 
-        fun controlMedia(context: Context, action: String) {
-            if (activeInstance == null) return
-            val manager = context.getSystemService(android.media.session.MediaSessionManager::class.java)
-            val component = android.content.ComponentName(context, RcsNotificationListenerService::class.java)
-            try {
-                val controllers = manager.getActiveSessions(component)
-                val controller = controllers.firstOrNull {
-                    it.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
-                } ?: controllers.firstOrNull() ?: return
-                val controls = controller.transportControls
-                when (action) {
-                    "play_pause" -> if (controller.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING) {
-                        controls.pause()
-                    } else { controls.play() }
-                    "next" -> controls.skipToNext()
-                    "previous" -> controls.skipToPrevious()
-                    "volume_up" -> controller.adjustVolume(android.media.AudioManager.ADJUST_RAISE, 0)
-                    "volume_down" -> controller.adjustVolume(android.media.AudioManager.ADJUST_LOWER, 0)
+        fun isControllableMediaNotification(sbn: StatusBarNotification): Boolean {
+            val service = activeInstance ?: return false
+            return verifiedMediaController(service, sbn) != null
+        }
+
+        fun controlMedia(context: Context, action: String, notificationId: String?) {
+            val service = activeInstance ?: return
+            // Commands target the exact verified notification shown by the Mac, never an unrelated player.
+            val notification = service.activeNotifications?.firstOrNull { it.key == notificationId } ?: return
+            val controller = verifiedMediaController(context, notification) ?: return
+            val controls = controller.transportControls
+            val actions = controller.playbackState?.actions ?: 0
+            val state = controller.playbackState?.state
+            when (action) {
+                "play_pause" -> if (state == android.media.session.PlaybackState.STATE_PLAYING) {
+                    if (actions and (android.media.session.PlaybackState.ACTION_PAUSE or android.media.session.PlaybackState.ACTION_PLAY_PAUSE) != 0L) controls.pause()
+                } else {
+                    if (actions and (android.media.session.PlaybackState.ACTION_PLAY or android.media.session.PlaybackState.ACTION_PLAY_PAUSE) != 0L) controls.play()
                 }
-            } catch (e: SecurityException) {
-                Log.w(TAG, "Notification access is required for media controls", e)
+                "next" -> if (actions and android.media.session.PlaybackState.ACTION_SKIP_TO_NEXT != 0L) controls.skipToNext()
+                "previous" -> if (actions and android.media.session.PlaybackState.ACTION_SKIP_TO_PREVIOUS != 0L) controls.skipToPrevious()
+                "volume_up" -> controller.adjustVolume(android.media.AudioManager.ADJUST_RAISE, 0)
+                "volume_down" -> controller.adjustVolume(android.media.AudioManager.ADJUST_LOWER, 0)
             }
         }
 
@@ -272,7 +298,8 @@ class RcsNotificationListenerService : NotificationListenerService() {
                             iconBase64 = artworkBase64,
                             canReply = canReply,
                             isClearable = sbn.isClearable,
-                            isMediaPlayback = isMedia
+                            isMediaPlayback = isMedia,
+                            mediaSessionVerified = isMedia
                         )
                     )
                 }
@@ -322,10 +349,20 @@ class RcsNotificationListenerService : NotificationListenerService() {
         super.onListenerConnected()
         activeInstance = this
         Log.d(TAG, "RcsNotificationListenerService connected")
+        try {
+            val manager = getSystemService(android.media.session.MediaSessionManager::class.java)
+            val component = android.content.ComponentName(this, RcsNotificationListenerService::class.java)
+            manager.addOnActiveSessionsChangedListener(sessionListener, component, mediaRefresh)
+            watchMediaControllers(manager.getActiveSessions(component))
+        } catch (_: SecurityException) {}
         refreshActiveNotifications()
     }
 
     override fun onDestroy() {
+        mediaRefresh.removeCallbacksAndMessages(null)
+        getSystemService(android.media.session.MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(sessionListener)
+        mediaCallbacks.forEach { (controller, callback) -> controller.unregisterCallback(callback) }
+        mediaCallbacks.clear()
         imageScope.cancel()
         if (activeInstance == this) {
             activeInstance = null
@@ -524,7 +561,8 @@ class RcsNotificationListenerService : NotificationListenerService() {
             iconBase64 = artworkBase64,
             canReply = canReply,
             isClearable = sbn.isClearable,
-            isMediaPlayback = isMedia
+            isMediaPlayback = isMedia,
+                            mediaSessionVerified = isMedia
         )
 
         val notifEnvelope = MessageEnvelope(

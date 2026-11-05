@@ -41,6 +41,9 @@ object EnvelopeTypes {
     const val NOTIFICATION_REMOVED = "notification_removed"
     const val MEDIA_CONTROL = "media_control"
     const val NOTIFICATION_DISMISS = "notification_dismiss"
+    const val MIRROR_START = "mirror_start"
+    const val MIRROR_STOP = "mirror_stop"
+    const val MIRROR_STATUS = "mirror_status"
     const val UNPAIR = "unpair"
 }
 
@@ -153,5 +156,6 @@ data class AppNotification(
     @SerializedName("iconBase64") val iconBase64: String? = null,
     @SerializedName("canReply") val canReply: Boolean = false,
     @SerializedName("isClearable") val isClearable: Boolean = true,
-    @SerializedName("isMediaPlayback") val isMediaPlayback: Boolean = false
+    @SerializedName("isMediaPlayback") val isMediaPlayback: Boolean = false,
+    @SerializedName("mediaSessionVerified") val mediaSessionVerified: Boolean = false
 )
